@@ -247,11 +247,12 @@ class ActorRolloutRefWorker(MegatronWorker):
     def _build_rollout(self):
         if self.config.rollout.name == 'vllm':
             from verl.workers.rollout.vllm_rollout import vLLMRollout, vllm_mode
-            from verl.workers.sharding_manager import MegatronVLLMShardingManager
+            from verl.workers.sharding_manager import MegatronVLLMShardingManager   # 这个管理器的核心职责就是充当 Megatron 训练权重和 vLLM 推理引擎之间的桥梁
             from verl.utils.model import normalize_pp_vpp_params
 
             # NOTE(sgm): If the QKV and gate_up projection layer are concate together in actor,
             # we will reorganize their weight format when resharding from actor to rollout.
+            # Megatron 可能将 QKV 矩阵或 MLP 层以某种方式融合或拆分存储，需要根据 vLLM 的期望，重新排列或合并这些权重张量。
             layer_name_mapping = {
                 "qkv_layer_name": "self_attention.linear_qkv.",
                 "gate_proj_layer_name": "linear_fc1.weight",
@@ -261,10 +262,10 @@ class ActorRolloutRefWorker(MegatronWorker):
             # create a new cuda space for parameters not in this pp rank
             self.hybrid_engine.load_params_to_cuda()
             # broadcast the parameters from pp rank to other ranks
-            self.hybrid_engine.allgather_params()
+            self.hybrid_engine.allgather_params()       # 由于 Megatron 的权重是分布式存储的，这可能涉及跨 TP 和 PP Rank 的参数收集
             # obtain name to parameters in pp/vpp
-            params = self.hybrid_engine.get_all_params()
-            # update the param name for the
+            params = self.hybrid_engine.get_all_params()    # 需要从 Megatron 的训练模型实例中收集所有必要的权重参数
+            # update the param name for the 命名规范化: 可能需要调整参数的名称以匹配 vLLM 的内部约定
             params = normalize_pp_vpp_params(params=params,
                                              num_hidden_layers=self.actor_model_config.num_hidden_layers,
                                              layer_name='layers')
@@ -410,8 +411,9 @@ class ActorRolloutRefWorker(MegatronWorker):
         with self.sharding_manager:
             log_gpu_memory_usage('After entering sharding manager', logger=logger)
 
+            # MegatronVLLMShardingManager可能还扮演着数据预处理和后处理的角色 (preprocess_data, postprocess_data)，确保输入和输出数据在 Verl 框架和 vLLM 引擎之间正确传递。
             prompts = self.sharding_manager.preprocess_data(prompts)
-            output = self.rollout.generate_sequences(prompts=prompts)
+            output = self.rollout.generate_sequences(prompts=prompts)   #调用 vLLM 的 API 来执行高效的推理生成。
 
             log_gpu_memory_usage('After rollout generation', logger=logger)
 
