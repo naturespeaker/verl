@@ -43,7 +43,7 @@ install_requires = [
     "wandb",
 ]
 
-TEST_REQUIRES = ["pytest", "yapf", "py-spy"]
+TEST_REQUIRES = ["pytest", "pre-commit", "py-spy"]
 PRIME_REQUIRES = ["pyext"]
 GEO_REQUIRES = ["mathruler"]
 GPU_REQUIRES = ["liger-kernel", "flash-attn"]

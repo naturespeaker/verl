@@ -151,7 +151,7 @@ class LLMEngine:
     def _init_workers_sp(self, model, distributed_init_method: str):
         # Lazy import the Worker to avoid importing torch.cuda/xformers
         # before CUDA_VISIBLE_DEVICES is set in the Worker
-        from .worker import Worker  # pylint: disable=import-outside-toplevel
+        from .worker import Worker
 
         rank = int(os.getenv("RANK"))
 
