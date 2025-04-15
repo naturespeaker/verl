@@ -175,6 +175,13 @@ Contributions from the community are welcome! Please check out our [project road
 
 ### Code Linting and Formatting
 
+> [!WARNING]
+> We are [immigrating to `ruff` as the linter and formatter and `pre-commit` as the managing tool](https://github.com/volcengine/verl/pull/1010).
+>
+> If your branch is based on a previous commit, simply merging might trigger overwhelming linting errors, while **you are only expected to resolve ones in the files related to your PR**.
+>
+> **Please use `git rebase` to rebase your branch to a commit after the immigration to avoid linting the files unrelated to your PR.**
+
 We use pre-commit to help improve code quality. To initialize pre-commit, run:
 
 ```bash
