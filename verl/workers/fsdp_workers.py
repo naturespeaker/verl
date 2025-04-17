@@ -268,7 +268,7 @@ class ActorRolloutRefWorker(Worker):
 
         # TODO: add more optimizer args into config
         if role == 'actor' and optim_config is not None:
-            from verl.utils.torch_functional import get_constant_schedule_with_warmup
+            from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
             actor_optimizer = optim.AdamW(actor_module_fsdp.parameters(),
                                           lr=optim_config.lr,
                                           betas=optim_config.get('betas', (0.9, 0.999)),
@@ -276,14 +276,22 @@ class ActorRolloutRefWorker(Worker):
 
             total_steps = optim_config.get('total_training_steps', 0)
             num_warmup_steps = int(optim_config.get('lr_warmup_steps', -1))
+            warmup_style = optim_config.get('warmup_style', 'constant')
             if num_warmup_steps < 0:
                 num_warmup_steps_ratio = optim_config.get('lr_warmup_steps_ratio', 0.)
                 num_warmup_steps = int(num_warmup_steps_ratio * total_steps)
 
             print(f'Total steps: {total_steps}, num_warmup_steps: {num_warmup_steps}')
 
-            actor_lr_scheduler = get_constant_schedule_with_warmup(optimizer=actor_optimizer,
-                                                                   num_warmup_steps=num_warmup_steps)
+            if warmup_style == 'constant':
+                actor_lr_scheduler = get_constant_schedule_with_warmup(optimizer=actor_optimizer,
+                                                                       num_warmup_steps=num_warmup_steps)
+            elif warmup_style == 'cosine':
+                actor_lr_scheduler = get_cosine_schedule_with_warmup(optimizer=actor_optimizer,
+                                                                     num_warmup_steps=num_warmup_steps,
+                                                                     num_training_steps=total_steps)
+            else:
+                raise NotImplementedError(f'Warmup style {warmup_style} is not supported')
         else:
             actor_optimizer = None
             actor_lr_scheduler = None
@@ -538,8 +546,11 @@ class ActorRolloutRefWorker(Worker):
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
-            output = self.actor.compute_log_prob(data=data)
-            output = DataProto.from_dict(tensors={'old_log_probs': output},
+            output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+            output = DataProto.from_dict(tensors={
+                'old_log_probs': output,
+                'entropys': entropys
+            },
                                          meta_info={'temperature': self.config.rollout.temperature})
             output = self.ulysses_sharding_manager.postprocess_data(output)
 
@@ -570,7 +581,7 @@ class ActorRolloutRefWorker(Worker):
         data.meta_info['use_dynamic_bsz'] = self.config.ref.log_prob_use_dynamic_bsz
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
-            output = self.ref_policy.compute_log_prob(data=data)
+            output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
             output = DataProto.from_dict(tensors={'ref_log_prob': output})
             output = self.ulysses_sharding_manager.postprocess_data(output)
 
@@ -767,15 +778,23 @@ class CriticWorker(Worker):
 
         total_steps = config.optim.get('total_training_steps', 0)
         num_warmup_steps = int(config.optim.get('lr_warmup_steps', -1))
+        warmup_style = config.optim.get('warmup_style', 'constant')
         if num_warmup_steps < 0:
             num_warmup_steps_ratio = config.optim.get('lr_warmup_steps_ratio', 0.)
             num_warmup_steps = int(num_warmup_steps_ratio * total_steps)
 
         print(f'Total steps: {total_steps}, num_warmup_steps: {num_warmup_steps}')
 
-        from verl.utils.torch_functional import get_constant_schedule_with_warmup
-        critic_lr_scheduler = get_constant_schedule_with_warmup(optimizer=critic_optimizer,
-                                                                num_warmup_steps=num_warmup_steps)
+        from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
+        if warmup_style == 'constant':
+            critic_lr_scheduler = get_constant_schedule_with_warmup(optimizer=critic_optimizer,
+                                                                    num_warmup_steps=num_warmup_steps)
+        elif warmup_style == 'cosine':
+            critic_lr_scheduler = get_cosine_schedule_with_warmup(optimizer=critic_optimizer,
+                                                                  num_warmup_steps=num_warmup_steps,
+                                                                  num_training_steps=total_steps)
+        else:
+            raise NotImplementedError(f'Warmup style {warmup_style} is not supported')
 
         return critic_module, critic_optimizer, critic_lr_scheduler
 
@@ -1081,7 +1100,10 @@ class RewardModelWorker(Worker):
 
         for i in range(data.batch.batch_size[0]):
             # extract raw prompt
-            chat: list = data.non_tensor_batch['raw_prompt'][i].tolist()
+            if isinstance(data.non_tensor_batch['raw_prompt'][i], list):
+                chat: list = data.non_tensor_batch['raw_prompt'][i]
+            else:
+                chat: list = data.non_tensor_batch['raw_prompt'][i].tolist()
 
             # extract response
             response_ids = data.batch['responses'][i]
@@ -1107,9 +1129,11 @@ class RewardModelWorker(Worker):
             max_length = self.config.get('max_length', src_max_length)
             if max_length is None:
                 max_length = src_max_length
-            input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(
-                prompt=prompt_with_chat_template,
-                tokenizer=target_tokenizer,
+
+            model_inputs = target_tokenizer(prompt_with_chat_template, return_tensors='pt', add_special_tokens=False)
+            input_ids, attention_mask = verl_F.postprocess_data(
+                input_ids=model_inputs['input_ids'],
+                attention_mask=model_inputs['attention_mask'],
                 max_length=max_length,
                 pad_token_id=target_tokenizer.pad_token_id,
                 left_pad=False,  # right padding

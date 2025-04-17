@@ -86,7 +86,8 @@ def convert_fsdp_checkpoints_to_hfmodels():
     assert world_size, "No model file with the proper format"
 
     state_dict = torch.load(os.path.join(local_dir, f'model_world_size_{world_size}_rank_{rank}.pt'),
-                            map_location='cpu')
+                            map_location='cpu',
+                            weights_only=False)
     pivot_key = sorted(list(state_dict.keys()))[0]
     weight = state_dict[pivot_key]
 
@@ -102,7 +103,7 @@ def convert_fsdp_checkpoints_to_hfmodels():
 
     print(f'Got device mesh {mesh}, mesh_dim_names {mesh_dim_names}')
 
-    assert mesh_dim_names in (('fsdp',),), f'Unsupported mesh_dim_names {mesh_dim_names}'
+    assert mesh_dim_names in (('fsdp',), ('ddp', 'fsdp')), f'Unsupported mesh_dim_names {mesh_dim_names}'
 
     if 'tp' in mesh_dim_names:
         # fsdp * tp
@@ -144,6 +145,8 @@ def convert_fsdp_checkpoints_to_hfmodels():
                 placements = tuple(tensor.placements)
                 # replicated placement at dp dimension can be discarded
                 if mesh_dim_names[0] == 'dp':
+                    placements = placements[1:]
+                elif mesh_dim_names[0] == 'ddp':
                     placements = placements[1:]
                 if key not in param_placements:
                     param_placements[key] = placements
