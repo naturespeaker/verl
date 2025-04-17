@@ -60,7 +60,7 @@ def main(config):
 
 
 def run_ppo(config) -> None:
-    # TODO(linjunrong.ocss884): this ENV is left for resolving SGLang conflict with ray devices
+    # TODO(linjunrong.ocss884): this ENV is left for resolving SGLang conflict with ray devices为了解决 SGLang 与 Ray 设备隔离的冲突
     # isolation, will solve in the future
     os.environ["ENSURE_CUDA_VISIBLE_DEVICES"] = os.environ.get('CUDA_VISIBLE_DEVICES', '')
     if not ray.is_initialized():
@@ -97,7 +97,7 @@ class TaskRunner:
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         processor = hf_processor(local_path, use_fast=True)  # used for multimodal LLM, could be none
 
-        # define worker classes
+        # define worker classes，目前只有fsdp支持sglang，且sglang只推理
         if config.actor_rollout_ref.actor.strategy == 'fsdp':
             assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
             from verl.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker
@@ -114,12 +114,12 @@ class TaskRunner:
             raise NotImplementedError
 
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
-
+        # 取消角色映射: 将不同的 PPO 角色（如 Role.ActorRollout, Role.Critic, Role.RefPolicy 等）映射到具体的 Ray Worker 类
         role_worker_mapping = {
             Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
             Role.Critic: ray.remote(CriticWorker),
         }
-
+        # 管理 GPU 资源分配
         global_pool_id = 'global_pool'
         resource_pool_spec = {
             global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
@@ -145,7 +145,7 @@ class TaskRunner:
             role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
             mapping[Role.RewardModel] = global_pool_id
 
-        #use reference model
+        #use reference model角色映射 Role.RefPolicy
         if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
             role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
             mapping[Role.RefPolicy] = global_pool_id
@@ -181,7 +181,7 @@ class TaskRunner:
                                            compute_score=compute_score,
                                            reward_fn_key=config.data.reward_fn_key)
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
-
+        # 创建 RayPPOTrainer 实例
         trainer = RayPPOTrainer(config=config,
                                 tokenizer=tokenizer,
                                 processor=processor,

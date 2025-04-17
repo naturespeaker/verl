@@ -493,7 +493,7 @@ def create_colocated_worker_cls(class_dict: dict[str, RayClassWithInitArgs]):
     # now monkey-patch the methods from inner class to WorkerDict
     for key, user_defined_cls in cls_dict.items():
         user_defined_cls = _unwrap_ray_remote(user_defined_cls)
-        _bind_workers_method_to_parent(WorkerDict, key, user_defined_cls)
+        _bind_workers_method_to_parent(WorkerDict, key, user_defined_cls)   # 为不同的 Actor 角色添加区分标识。
 
     remote_cls = ray.remote(WorkerDict)
     remote_cls = RayClassWithInitArgs(cls=remote_cls)

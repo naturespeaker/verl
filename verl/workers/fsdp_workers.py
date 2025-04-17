@@ -343,7 +343,7 @@ class ActorRolloutRefWorker(Worker):
             # "RuntimeError: No CUDA GPUs are available".
             # For this reason, sharding_manager.__init__ should not import FSDPSGLangShardingManager and we import it here use the abs path.
             # check: https://github.com/sgl-project/sglang/blob/00f42707eaddfc2c0528e5b1e0094025c640b7a0/python/sglang/srt/layers/quantization/fp8_utils.py#L76
-            from verl.workers.sharding_manager.fsdp_sglang import FSDPSGLangShardingManager
+            from verl.workers.sharding_manager.fsdp_sglang import FSDPSGLangShardingManager # 在需要时，将 FSDP 分片的模型参数同步或转换成 sglang 推理引擎能够理解和使用的格式
             log_gpu_memory_usage(f'Before building {rollout_name} rollout', logger=None)
             rollout = SGLangRollout(actor_module=self.config.model.path,
                                     config=self.config.rollout,
@@ -356,7 +356,7 @@ class ActorRolloutRefWorker(Worker):
             rollout_sharding_manager = FSDPSGLangShardingManager(module=self.actor_module_fsdp,
                                                                  inference_engine=rollout.inference_engine,
                                                                  model_config=self.actor_model_config,
-                                                                 full_params='hf' in self.config.rollout.load_format,
+                                                                 full_params='hf' in self.config.rollout.load_format,   # 可能需要加载完整的 HF 格式参数给 sglang。
                                                                  device_mesh=rollout_device_mesh)
             log_gpu_memory_usage('After building sharding manager', logger=None)
 
@@ -439,7 +439,8 @@ class ActorRolloutRefWorker(Worker):
     def update_actor(self, data: DataProto):
         # Support all hardwares
         data = data.to(torch.cuda.current_device())
-
+        # 训练 (update_actor) 直接使用 FSDP 包装的模型 (self.actor_module_fsdp) 和优化器。
+        # 推理 (generate_sequences) 则委托给专门的 sglang 引擎，通过 Sharding Manager 进行参数同步。
         assert self._is_actor
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
@@ -488,7 +489,7 @@ class ActorRolloutRefWorker(Worker):
 
         assert self._is_rollout
         if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)  #  在 generate_sequences 期间，如果配置了参数卸载 (_is_offload_param)，FSDP 模型参数可能会在进入 Sharding Manager 上下文时加载到 GPU
 
         meta_info = {
             'eos_token_id':
@@ -503,7 +504,7 @@ class ActorRolloutRefWorker(Worker):
 
             # after parameters sync with rollout, offload actor model to CPU
             if self._is_offload_param:
-                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)   # 在参数同步给 sglang 后（或 Sharding Manager 上下文退出时）卸载回 CPU，以节省 GPU 显存给 sglang 使用。
             if self._is_offload_optimizer:
                 offload_fsdp_optimizer(optimizer=self.actor_optimizer)
 
