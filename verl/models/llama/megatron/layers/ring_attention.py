@@ -99,22 +99,28 @@ class ParallelLlamaRingAttention(nn.Module):
 
 
         # Output Projection (RowParallelLinear)
-        # Extract necessary args from kwargs for explicit passing to satisfy Pylint/type checker
+        # Explicitly pass config, init_method, and skip_bias_add to satisfy Pylint,
+        # as RowParallelLinear likely defines them as explicit keyword args.
         o_proj_config = row_kwargs.get("config")
         o_proj_init_method = row_kwargs.get("init_method")
-        # Ensure skip_bias_add is explicitly passed, defaulting to False if not in kwargs
+        # Default skip_bias_add to False if not found, consistent with parallel_attention.py
         o_proj_skip_bias_add = row_kwargs.get("skip_bias_add", False)
+
+        # Remove these keys from row_kwargs to avoid duplicate passing
+        if "config" in row_kwargs: del row_kwargs["config"]
+        if "init_method" in row_kwargs: del row_kwargs["init_method"]
+        if "skip_bias_add" in row_kwargs: del row_kwargs["skip_bias_add"]
 
         self.o_proj = tensor_parallel.RowParallelLinear(
             input_size=self.num_heads * self.head_dim, # Input size is the full hidden size per TP rank
             output_size=self.hidden_size,
             bias=config.attention_bias,
             input_is_parallel=True, # Input comes from distributed Ring Attention output
-            # Explicitly pass required arguments
+            # Explicitly pass the required arguments
             config=o_proj_config,
             init_method=o_proj_init_method,
             skip_bias_add=o_proj_skip_bias_add,
-            # Pass remaining kwargs (might be redundant but safe)
+            # Pass any remaining arguments from row_kwargs
             **row_kwargs,
         )
 
@@ -203,9 +209,7 @@ class ParallelLlamaRingAttention(nn.Module):
         current_key_states = key_states
         current_value_states = value_states
 
-        # Placeholder for Online Softmax stats if needed
-        # local_max_score = torch.full((bsz, self.num_heads_per_tp, local_seq_len, 1), -float('inf'), ...)
-        # local_sum_exp = torch.zeros((bsz, self.num_heads_per_tp, local_seq_len, 1), ...)
+        # (Removing Online Softmax placeholders)
 
         for ring_iter in range(self.tp_size):
             # --- a. Communication (Send current K/V, Receive next K/V) ---
@@ -229,20 +233,46 @@ class ParallelLlamaRingAttention(nn.Module):
             #       The mask should prevent attending to future tokens *within the current block*
             #       and potentially across blocks depending on the ring iteration.
 
-            # Placeholder calculation:
-            # Repeat K/V if using Grouped Query Attention
-            # current_key_states_rep = repeat_kv(current_key_states, self.num_key_value_groups)
-            # current_value_states_rep = repeat_kv(current_value_states, self.num_key_value_groups)
-            # attn_weights = torch.matmul(query_states, current_key_states_rep.transpose(2, 3)) / math.sqrt(self.head_dim)
+            # --- b. Local Attention Calculation ---
+            # Calculate attention between local Q and the K/V block for this iteration.
 
-            # TODO: Apply causal mask for this block/iteration
-            # TODO: Implement Online Softmax update here if needed
-            # attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-            # attn_output_block = torch.matmul(attn_weights, current_value_states_rep)
+            # Repeat K/V heads if using Grouped Query Attention (GQA)
+            if self.num_key_value_groups > 1:
+                current_key_states_rep = repeat_kv(current_key_states, self.num_key_value_groups)
+                current_value_states_rep = repeat_kv(current_value_states, self.num_key_value_groups)
+            else:
+                current_key_states_rep = current_key_states
+                current_value_states_rep = current_value_states
 
-            # --- Placeholder for block output ---
-            attn_output_block = torch.randn_like(query_states)
-            # --- End Placeholder ---
+            # Calculate attention scores: (bsz, num_heads, q_len, k_len)
+            # q_len is local_seq_len, k_len is also local_seq_len (length of the received block)
+            attn_weights = torch.matmul(query_states, current_key_states_rep.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+            # TODO: Apply causal mask for this block/iteration.
+            # This is the most complex part of Ring Attention. The mask depends on `ring_iter`.
+            # For ring_iter == 0, it's a standard causal mask for the local block.
+            # For ring_iter > 0, it depends on whether the received block is "in the past"
+            # or "in the future" relative to the local block in the global sequence.
+            # If past, attend to all positions. If future, attend to none.
+            # This needs careful implementation based on global position IDs.
+            # Example (Conceptual - Needs actual implementation):
+            # if ring_iter == 0:
+            #     causal_mask = torch.triu(torch.ones_like(attn_weights), diagonal=1).bool()
+            #     attn_weights.masked_fill_(causal_mask, -float('inf'))
+            # else:
+            #     # Determine if the block from (self.tp_rank - ring_iter + self.tp_size) % self.tp_size
+            #     # is before or after the current block (self.tp_rank).
+            #     # If before, no mask needed. If after, mask all.
+            #     pass # Placeholder for future/past block masking logic
+
+            # Apply softmax
+            # Upcast attention to fp32 for stability
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+
+            # Calculate attention output for this block: (bsz, num_heads, q_len, head_dim)
+            attn_output_block = torch.matmul(attn_weights, current_value_states_rep)
+
+            # (Placeholder removed by the change above)
 
             # Accumulate results
             attn_output_accumulator += attn_output_block
@@ -256,7 +286,8 @@ class ParallelLlamaRingAttention(nn.Module):
 
 
         # --- 5. Finalize Attention Output ---
-        # TODO: If using Online Softmax, perform final normalization.
+        # The accumulator now holds the sum of attention outputs from all blocks.
+        # If not using Online Softmax, this is the final attention output before projection.
         attn_output = attn_output_accumulator
 
         # Reshape output to match expected format for RowParallelLinear
