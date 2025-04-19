@@ -232,22 +232,26 @@ class ParallelLlamaRingAttention(nn.Module):
             # q_len is local_seq_len, k_len is also local_seq_len (length of the received block)
             attn_weights = torch.matmul(query_states, current_key_states_rep.transpose(2, 3)) / math.sqrt(self.head_dim)
 
-            # TODO: Apply causal mask for this block/iteration.
-            # This is the most complex part of Ring Attention. The mask depends on `ring_iter`.
-            # For ring_iter == 0, it's a standard causal mask for the local block.
-            # For ring_iter > 0, it depends on whether the received block is "in the past"
-            # or "in the future" relative to the local block in the global sequence.
-            # If past, attend to all positions. If future, attend to none.
-            # This needs careful implementation based on global position IDs.
-            # Example (Conceptual - Needs actual implementation):
-            # if ring_iter == 0:
-            #     causal_mask = torch.triu(torch.ones_like(attn_weights), diagonal=1).bool()
-            #     attn_weights.masked_fill_(causal_mask, -float('inf'))
-            # else:
-            #     # Determine if the block from (self.tp_rank - ring_iter + self.tp_size) % self.tp_size
-            #     # is before or after the current block (self.tp_rank).
-            #     # If before, no mask needed. If after, mask all.
-            #     pass # Placeholder for future/past block masking logic
+            # Apply causal mask based on ring iteration
+            if ring_iter == 0:
+                # Local block: Standard causal mask
+                # attn_weights shape: (bsz, num_heads_per_tp, local_seq_len, local_seq_len)
+                causal_mask = torch.triu(
+                    torch.ones((local_seq_len, local_seq_len), device=attn_weights.device, dtype=torch.bool),
+                    diagonal=1
+                )
+                # Expand mask to broadcast: (1, 1, local_seq_len, local_seq_len)
+                causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+                attn_weights.masked_fill_(causal_mask, torch.finfo(attn_weights.dtype).min) # Use min value of dtype
+            else:
+                # Remote block: Check if it's from the future
+                source_rank = (self.tp_rank - ring_iter + self.tp_size) % self.tp_size
+                # Assuming ranks process contiguous blocks (0, 1, 2, ...),
+                # if source_rank > current rank, it's a future block.
+                if source_rank > self.tp_rank:
+                    # Mask all attention to future blocks
+                    attn_weights.fill_(torch.finfo(attn_weights.dtype).min) # Use min value of dtype
+                # Else (source_rank < self.tp_rank): It's a past block, no mask needed.
 
             # Apply softmax
             # Upcast attention to fp32 for stability
