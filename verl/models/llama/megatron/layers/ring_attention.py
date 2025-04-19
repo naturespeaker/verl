@@ -98,29 +98,13 @@ class ParallelLlamaRingAttention(nn.Module):
         self.v_size = self.num_key_value_heads_per_tp * self.head_dim
 
 
-        # Output Projection (RowParallelLinear)
-        # Explicitly pass config, init_method, and skip_bias_add to satisfy Pylint,
-        # as RowParallelLinear likely defines them as explicit keyword args.
-        o_proj_config = row_kwargs.get("config")
-        o_proj_init_method = row_kwargs.get("init_method")
-        # Default skip_bias_add to False if not found, consistent with parallel_attention.py
-        o_proj_skip_bias_add = row_kwargs.get("skip_bias_add", False)
-
-        # Remove these keys from row_kwargs to avoid duplicate passing
-        if "config" in row_kwargs: del row_kwargs["config"]
-        if "init_method" in row_kwargs: del row_kwargs["init_method"]
-        if "skip_bias_add" in row_kwargs: del row_kwargs["skip_bias_add"]
-
         self.o_proj = tensor_parallel.RowParallelLinear(
-            input_size=self.num_heads * self.head_dim, # Input size is the full hidden size per TP rank
+            input_size=self.num_heads * self.head_dim,
             output_size=self.hidden_size,
-            bias=config.attention_bias,
-            input_is_parallel=True, # Input comes from distributed Ring Attention output
-            # Explicitly pass the required arguments
-            config=o_proj_config,
-            init_method=o_proj_init_method,
-            skip_bias_add=o_proj_skip_bias_add,
-            # Pass any remaining arguments from row_kwargs
+            # bias=config.attention_bias,
+            bias=False,
+            input_is_parallel=True,
+            skip_bias_add=False,
             **row_kwargs,
         )
 
@@ -290,17 +274,11 @@ class ParallelLlamaRingAttention(nn.Module):
         # If not using Online Softmax, this is the final attention output before projection.
         attn_output = attn_output_accumulator
 
-        # Reshape output to match expected format for RowParallelLinear
-        # Example: (bsz, num_heads_per_tp, local_seq_len, head_dim) -> (bsz, local_seq_len, hidden_size_per_tp) -> (local_seq_len * bsz, hidden_size_per_tp) ?
-        # The exact reshape depends on RowParallelLinear's expectation when input_is_parallel=True
-        # It might expect (seq_len * bsz / tp, hidden_size) or similar. Needs verification.
-
-        # --- Placeholder reshape ---
-        # attn_output = attn_output.transpose(1, 2).contiguous() # (bsz, local_seq_len, num_heads_per_tp, head_dim)
-        # attn_output = attn_output.reshape(bsz, local_seq_len, self.hidden_size_per_tp) # (bsz, local_seq_len, hidden_size_per_tp)
-        # Need to match o_proj input format when input_is_parallel=True
-        attn_output = attn_output.permute(2, 0, 1, 3).reshape(local_seq_len * bsz, self.hidden_size_per_tp) # Example: (local_seq_len * bsz, hidden_size_per_tp)
-        # --- End Placeholder ---
+        # Reshape output for RowParallelLinear input
+        # Input shape: (bsz, num_heads_per_tp, local_seq_len, head_dim)
+        # Target shape: (bsz * local_seq_len, hidden_size_per_tp)
+        attn_output = attn_output.transpose(1, 2).contiguous() # -> (bsz, local_seq_len, num_heads_per_tp, head_dim)
+        attn_output = attn_output.view(bsz * local_seq_len, self.hidden_size_per_tp) # -> (bsz * local_seq_len, hidden_size_per_tp)
 
 
         # --- 6. Output Projection ---
@@ -311,8 +289,8 @@ class ParallelLlamaRingAttention(nn.Module):
         # Example: If input was (local_seq_len, bsz, hidden_size), output should be the same.
         # output = output.view(local_seq_len, bsz, self.hidden_size) # Example reshape
 
-        # --- Placeholder reshape ---
-        output = output.view(local_seq_len, bsz, self.hidden_size)
-        # --- End Placeholder ---
+        # Reshape final output to match the input hidden_states shape: (local_seq_len, bsz, hidden_size)
+        # o_proj output shape: (bsz * local_seq_len, hidden_size)
+        output = output.view(bsz, local_seq_len, self.hidden_size).transpose(0, 1).contiguous() # -> (local_seq_len, bsz, hidden_size)
 
         return output
