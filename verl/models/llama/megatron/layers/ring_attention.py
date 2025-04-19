@@ -26,6 +26,7 @@ from transformers import LlamaConfig
 # Potentially reuse or adapt components from parallel_attention
 from .parallel_linear import QKVParallelLinear
 from .parallel_attention import LlamaRotaryEmbedding, apply_rotary_pos_emb, repeat_kv # Check if RoPE needs modification for ring
+from verl.utils.megatron import tensor_parallel as tp_utils
 
 # Potentially use flash_attn components if integrating Flash Attention
 # from flash_attn import flash_attn_varlen_func
@@ -65,19 +66,32 @@ class ParallelLlamaRingAttention(nn.Module):
         self.num_key_value_heads_per_tp = self.num_key_value_heads // self.tp_size
         self.hidden_size_per_tp = self.hidden_size // self.tp_size
 
+        # --- Get Parallelism Kwargs ---
+        column_kwargs = tp_utils.get_default_kwargs_for_column_parallel_linear()
+        row_kwargs = tp_utils.get_default_kwargs_for_row_parallel_linear()
+        if megatron_config is not None:
+            # Ensure config objects are present in default kwargs (they should be)
+            if "config" not in column_kwargs: column_kwargs["config"] = megatron_config
+            if "config" not in row_kwargs: row_kwargs["config"] = megatron_config
+            # Update kwargs based on the provided megatron_config
+            tp_utils.update_kwargs_with_config(column_kwargs, megatron_config)
+            tp_utils.update_kwargs_with_config(row_kwargs, megatron_config)
+        else:
+            # Handle case where megatron_config might be None if necessary
+            # For now, assume it's always provided
+            pass
+
         # --- Layers ---
-        # QKV Projection (Consider reusing or adapting QKVParallelLinear)
-        # TODO: Verify if QKVParallelLinear needs changes for Ring Attention context
-        #       or if a standard ColumnParallelLinear followed by manual splitting is better.
+        # QKV Projection
         self.qkv_proj = QKVParallelLinear(
             input_size=self.hidden_size,
             num_heads=self.num_heads,
             num_key_value_heads=self.num_key_value_heads,
             head_dim=self.head_dim,
             bias=config.attention_bias,
-            # gather_output=False, # Ring attention handles distribution differently
-            # skip_bias_add=False,
-            # **column_kwargs, # Need to get appropriate kwargs
+            gather_output=False, # Keep QKV split across TP ranks
+            skip_bias_add=False, # Let the layer handle bias addition
+            **column_kwargs,
         )
         self.q_size = self.num_heads_per_tp * self.head_dim
         self.k_size = self.num_key_value_heads_per_tp * self.head_dim
@@ -85,20 +99,33 @@ class ParallelLlamaRingAttention(nn.Module):
 
 
         # Output Projection (RowParallelLinear)
+        # Extract necessary args from kwargs for explicit passing to satisfy Pylint/type checker
+        o_proj_config = row_kwargs.get("config")
+        o_proj_init_method = row_kwargs.get("init_method")
+        # Ensure skip_bias_add is explicitly passed, defaulting to False if not in kwargs
+        o_proj_skip_bias_add = row_kwargs.get("skip_bias_add", False)
+
         self.o_proj = tensor_parallel.RowParallelLinear(
-            input_size=self.num_heads * self.head_dim, # Input is gathered across TP group before projection
+            input_size=self.num_heads * self.head_dim, # Input size is the full hidden size per TP rank
             output_size=self.hidden_size,
             bias=config.attention_bias,
-            input_is_parallel=True, # Output of Ring Attention should be gathered
-            # skip_bias_add=False,
-            # **row_kwargs, # Need to get appropriate kwargs
+            input_is_parallel=True, # Input comes from distributed Ring Attention output
+            # Explicitly pass required arguments
+            config=o_proj_config,
+            init_method=o_proj_init_method,
+            skip_bias_add=o_proj_skip_bias_add,
+            # Pass remaining kwargs (might be redundant but safe)
+            **row_kwargs,
         )
 
         # --- RoPE ---
-        # TODO: Initialize RoPE. Need to carefully consider how position_ids are handled
-        #       across the distributed sequence length. The standard RoPE might need adaptation
-        #       or careful application based on global position IDs for each chunk.
-        # self.rotary_emb = LlamaRotaryEmbedding(...) # Or scaled versions
+        # Initialize RoPE based on LlamaConfig
+        # We assume position_ids passed to forward will be global and handle slicing there.
+        self.rotary_emb = LlamaRotaryEmbedding(
+            self.head_dim,
+            max_position_embeddings=self.max_position_embeddings,
+            base=self.rope_theta,
+        )
 
         # --- Ring Communication Setup ---
         self.send_rank = (self.tp_rank + 1) % self.tp_size
@@ -123,39 +150,42 @@ class ParallelLlamaRingAttention(nn.Module):
         # global_seq_len = local_seq_len * self.tp_size # Assuming sequence is perfectly divisible for now
 
         # --- 1. QKV Projection ---
-        # TODO: Project hidden_states to Q, K, V.
-        # qkv = self.qkv_proj(hidden_states)[0] # Assuming qkv_proj handles TP splitting internally
-        # query_states, key_states, value_states = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1) # Or dim=2 depending on input shape
+        # Project hidden_states to Q, K, V using the parallel linear layer.
+        # qkv_proj likely returns (output, bias), we take the output.
+        qkv_output, _ = self.qkv_proj(hidden_states)
+        # Split the combined QKV tensor into individual Q, K, V tensors.
+        # The dimension for splitting depends on the output shape of QKVParallelLinear.
+        # Assuming output shape is (local_seq_len, bsz, hidden_size_per_tp * (num_q_groups + 2)) where num_q_groups = num_heads / num_kv_heads
+        # Or more likely (local_seq_len, bsz, q_size + k_size + v_size) where sizes are per TP rank.
+        query_states, key_states, value_states = qkv_output.split([self.q_size, self.k_size, self.v_size], dim=2) # dim=2 if shape is (seq, batch, features)
 
-        # --- Placeholder for QKV calculation ---
-        # Assuming hidden_states is (local_seq_len, bsz, hidden_size)
-        # This part needs careful implementation based on QKVParallelLinear or alternatives
-        query_states = torch.randn(local_seq_len, bsz, self.num_heads_per_tp, self.head_dim, device=hidden_states.device, dtype=hidden_states.dtype)
-        key_states = torch.randn(local_seq_len, bsz, self.num_key_value_heads_per_tp, self.head_dim, device=hidden_states.device, dtype=hidden_states.dtype)
-        value_states = torch.randn(local_seq_len, bsz, self.num_key_value_heads_per_tp, self.head_dim, device=hidden_states.device, dtype=hidden_states.dtype)
-        # --- End Placeholder ---
+        # (No direct replacement needed here as the placeholder is removed by the change above)
 
         # Reshape Q, K, V for attention calculation
         # Example: (local_seq_len, bsz, num_heads, head_dim) -> (bsz, num_heads, local_seq_len, head_dim)
         # query_states = query_states.view(local_seq_len, bsz, self.num_heads_per_tp, self.head_dim).permute(1, 2, 0, 3)
         # key_states = key_states.view(local_seq_len, bsz, self.num_key_value_heads_per_tp, self.head_dim).permute(1, 2, 0, 3)
-        # value_states = value_states.view(local_seq_len, bsz, self.num_key_value_heads_per_tp, self.head_dim).permute(1, 2, 0, 3)
-        # --- Placeholder for reshape ---
-        query_states = query_states.permute(1, 2, 0, 3) # (bsz, num_heads_per_tp, local_seq_len, head_dim)
-        key_states = key_states.permute(1, 2, 0, 3)   # (bsz, num_key_value_heads_per_tp, local_seq_len, head_dim)
-        value_states = value_states.permute(1, 2, 0, 3) # (bsz, num_key_value_heads_per_tp, local_seq_len, head_dim)
-        # --- End Placeholder ---
+        value_states = value_states.view(local_seq_len, bsz, self.num_key_value_heads_per_tp, self.head_dim).permute(1, 2, 0, 3)
+
+        # Reshape Q, K for attention calculation: (seq_len, bsz, num_heads, head_dim) -> (bsz, num_heads, seq_len, head_dim)
+        query_states = query_states.view(local_seq_len, bsz, self.num_heads_per_tp, self.head_dim).permute(1, 2, 0, 3)
+        key_states = key_states.view(local_seq_len, bsz, self.num_key_value_heads_per_tp, self.head_dim).permute(1, 2, 0, 3)
+        # value_states is already reshaped above
 
 
         # --- 2. Apply RoPE ---
-        # TODO: Apply Rotary Positional Embeddings.
-        #       Requires `cos` and `sin` calculated based on *global* `position_ids`.
-        #       The `position_ids` passed to forward should correspond to the global positions
-        #       for the `local_seq_len` chunk this rank is processing.
-        # cos, sin = self.rotary_emb(value_states, seq_len=global_seq_len) # Calculate for full sequence? Or just needed part?
-        # cos_chunk = cos[position_ids] # Select the relevant part
-        # sin_chunk = sin[position_ids]
-        # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos_chunk, sin_chunk, position_ids=None) # position_ids already used for slicing cos/sin
+        # Calculate cos and sin frequencies based on the maximum sequence length.
+        # We assume position_ids are provided correctly for the local chunk's global positions.
+        cos, sin = self.rotary_emb(value_states, seq_len=self.max_position_embeddings) # Use max_position_embeddings for cache size
+
+        # Select the cosine and sine values corresponding to the specific position_ids for this chunk.
+        # position_ids shape needs to be compatible for indexing. Expected: (local_seq_len) or (1, local_seq_len)
+        # cos/sin shape: (max_pos, 1, head_dim/2) or similar. Indexing needs care.
+        # Let's assume position_ids is (local_seq_len) and needs unsqueezing.
+        # cos = cos[position_ids].unsqueeze(1) # Shape: (local_seq_len, 1, dim)
+        # sin = sin[position_ids].unsqueeze(1) # Shape: (local_seq_len, 1, dim)
+        # The apply_rotary_pos_emb function likely expects cos/sin indexed by position_ids directly.
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         # --- 3. Prepare for Ring Communication ---
         # Make K/V contiguous if needed for communication
