@@ -73,8 +73,8 @@ class ParallelLlamaRingAttentionRmPad(nn.Module):
              raise ValueError("RingAttention requires tensor parallel world size > 1.")
 
         assert self.num_heads % self.tp_size == 0, "num_heads must be divisible by tp_size"
-        # Allow KV heads to be non-divisible if using GQA/MQA, TP splits Q heads
-        # assert self.num_key_value_heads % self.tp_size == 0, "num_key_value_heads must be divisible by tp_size"
+        # QKVParallelLinear splits across the combined QKV dimension, so KV heads must also be divisible by TP size.
+        assert self.num_key_value_heads % self.tp_size == 0, "num_key_value_heads must be divisible by tp_size for QKVParallelLinear"
 
         self.num_heads_per_tp = self.num_heads // self.tp_size
         # KV heads are replicated across TP ranks in Megatron's TP strategy for Attention
@@ -115,15 +115,11 @@ class ParallelLlamaRingAttentionRmPad(nn.Module):
         # Assuming output is (..., q_local_dim + k_total_dim + v_total_dim) split by TP? No, that's complex.
         # More likely: Output is (..., hidden_qkv_local = (num_q_local + num_kv_local + num_kv_local) * head_dim)
         # Let's stick to the simpler calculation based on local head counts derived from TP split:
-        self.k_size = self.num_key_value_heads_per_tp * self.head_dim # This assumes KV heads are split by TP, which might be wrong for Megatron.
-        self.v_size = self.num_key_value_heads_per_tp * self.head_dim # Revisit this if QKVParallelLinear replicates KV.
+        self.k_size = self.num_key_value_heads_per_tp * self.head_dim
+        self.v_size = self.num_key_value_heads_per_tp * self.head_dim
+        # Based on QKVParallelLinear analysis, K/V are split, not replicated.
 
-        # If K/V are replicated (standard Megatron):
-        self.k_size_total = self.num_key_value_heads * self.head_dim
-        self.v_size_total = self.num_key_value_heads * self.head_dim
-
-
-        self.o_proj = tensor_parallel.RowParallelLinear(
+        self.o_proj = tensor_parallel.RowParallelLinear( # Output projection
             # Input size should be the local hidden size partition
             input_size=self.hidden_size_per_tp, # Input is parallel
             output_size=self.hidden_size, # Output is gathered
@@ -343,9 +339,7 @@ class ParallelLlamaRingAttentionRmPad(nn.Module):
         # Output shape: (total_tokens_local, 1, q_size + k_size + v_size) where sizes are local TP partitions
         qkv_output_packed = qkv_output_packed.squeeze(1) # -> (total_tokens_local, q+k+v_local_size)
 
-        # Adjust split sizes based on potential K/V replication
-        # If K/V replicated, k_size/v_size should be k_size_total/v_size_total? No, proj is local.
-        # Let's assume the local sizes computed in __init__ are correct for the split.
+        # Split the packed output based on local sizes (Q, K, V are all split by TP)
         query_states, key_states, value_states = qkv_output_packed.split(
              [self.q_size, self.k_size, self.v_size], dim=-1
         )
@@ -475,6 +469,7 @@ class ParallelLlamaRingAttentionRmPad(nn.Module):
                 attn_weights.masked_fill_(attn_mask, torch.finfo(attn_weights.dtype).min)
 
                 attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q_perm.dtype)
+                attn_weights = nn.functional.dropout(attn_weights, p=self.dropout_p, training=self.training) # Add dropout
                 attn_output_block_padded = torch.matmul(attn_weights, v_perm) # (bs_q, num_q, seqlen_q, dim)
                 attn_output_block_padded = attn_output_block_padded.permute(0, 2, 1, 3) # -> (bs_q, seqlen_q, num_q, dim)
 
