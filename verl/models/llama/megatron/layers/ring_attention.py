@@ -23,7 +23,7 @@ from megatron.core import ModelParallelConfig, tensor_parallel # Import ModelPar
 from megatron.core import parallel_state as mpu
 from torch import nn
 from transformers import LlamaConfig
-# from transformers.utils import is_flash_attn_2_available # No longer needed
+from transformers.utils import is_flash_attn_2_available
 
 # Reuse or adapt components from parallel_attention
 from .parallel_linear import QKVParallelLinear
@@ -35,82 +35,10 @@ from .parallel_attention import (
 )
 from verl.utils.megatron import tensor_parallel as tp_utils
 
-# Try to import flash_attn for optimized attention
-try:
+
+if is_flash_attn_2_available():
     from flash_attn import flash_attn_varlen_func
-    _flash_attn_available = True
-except ImportError:
-    print("WARN: flash_attn not found. RingAttention will fall back to manual attention calculation, which might be slow.")
-    _flash_attn_available = False
-
-
-# --- Custom Padding/Unpadding Functions (Replicating flash_attn.bert_padding) ---
-# These might still be needed for RoPE or other parts if not using flash_attn's RoPE
-
-def pad_input_custom(x: torch.Tensor, indices: torch.Tensor, batch_size: int, seqlen: int) -> torch.Tensor:
-    """
-    Pads unpadded input `x` back to padded tensor using pure PyTorch.
-    Args:
-        x: (total_tokens, ...) tensor.
-        indices: (total_tokens,) tensor containing the index (batch_idx * seqlen + seq_idx) for each token.
-        batch_size: int.
-        seqlen: int.
-    Returns:
-        (batch_size, seqlen, ...) tensor.
-    """
-    output_shape = (batch_size * seqlen, *x.shape[1:])
-    output = torch.zeros(output_shape, dtype=x.dtype, device=x.device)
-    # Scatter the data from x into the appropriate positions in output
-    output[indices] = x
-    return output.view(batch_size, seqlen, *x.shape[1:])
-
-def index_first_axis_custom(x: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-    """
-    Selects tokens from padded tensor `x` based on `indices` using pure PyTorch.
-    Args:
-        x: (batch_size, seqlen, ...) tensor.
-        indices: (total_tokens,) tensor containing the index (batch_idx * seqlen + seq_idx) for each token.
-    Returns:
-        (total_tokens, ...) tensor.
-    """
-    bs, seqlen = x.shape[0], x.shape[1]
-    x_flat = x.view(bs * seqlen, *x.shape[2:])
-    # Gather the data from x_flat based on indices
-    return x_flat[indices]
-
-# --- End Custom Padding/Unpadding ---
-
-
-# Helper function for applying RoPE on unpadded data (manual version using custom padding)
-# Keep this as RoPE might be applied before the main padding/unpadding logic for attention
-def apply_rotary_pos_emb_unpadded_custom(q, k, cos, sin, position_ids, indices, sequence_length):
-    # q, k: (total_tokens, num_heads, head_dim)
-    # cos, sin: (max_seq_len, dim)
-    # position_ids: (batch_size, max_seq_len) - Contains global positions
-    # indices: (total_tokens,) - Maps token index back to (batch_idx * seqlen + seq_idx)
-    # sequence_length: int - Max sequence length in the batch
-
-    batch_size = position_ids.shape[0]
-
-    # Pad q and k using custom function
-    q_padded = pad_input_custom(q, indices, batch_size, sequence_length) # (bs, seqlen, num_q_heads, head_dim)
-    k_padded = pad_input_custom(k, indices, batch_size, sequence_length) # (bs, seqlen, num_kv_heads, head_dim)
-
-    # Select cos/sin based on position_ids
-    # Ensure position_ids are clamped or handled correctly if they exceed cos/sin length
-    pos_ids_clamped = torch.clamp(position_ids, max=cos.shape[0]-1)
-    cos_pos = cos[pos_ids_clamped].unsqueeze(2) # (bs, seqlen, 1, dim)
-    sin_pos = sin[pos_ids_clamped].unsqueeze(2) # (bs, seqlen, 1, dim)
-
-    # Apply RoPE on padded tensors
-    q_embed_padded = (q_padded * cos_pos) + (rotate_half(q_padded) * sin_pos)
-    k_embed_padded = (k_padded * cos_pos) + (rotate_half(k_padded) * sin_pos)
-
-    # Unpad back using custom function
-    q_embed = index_first_axis_custom(q_embed_padded, indices) # (total_tokens, num_q, dim)
-    k_embed = index_first_axis_custom(k_embed_padded, indices) # (total_tokens, num_kv, dim)
-
-    return q_embed, k_embed
+    from flash_attn.layers.rotary import apply_rotary_emb as apply_rotary_emb_flash
 
 class ParallelLlamaRingAttentionRmPad(nn.Module):
     """
@@ -433,20 +361,29 @@ class ParallelLlamaRingAttentionRmPad(nn.Module):
         if position_ids is None:
              raise ValueError("`position_ids` (global) must be provided for RoPE.")
 
-        # Generate cos/sin cache based on max sequence length
-        # Use max_seqlen_in_batch for potentially shorter sequences in this batch
-        cos, sin = self.rotary_emb(value_states, seq_len=max_seqlen_in_batch)
+        if is_flash_attn_2_available():
+            # Calculate local sequence info for initial Q/K needed for flash RoPE
+            (_, cu_seqlens_local_init, max_seqlen_local_init, _, _, _) = \
+                self._pad_local_data(query_states, indices_local, cu_seqlens) # Use query_states arbitrarily
 
-        # Apply RoPE using the custom unpadded helper function
-        query_states, key_states = apply_rotary_pos_emb_unpadded_custom(
-            query_states,
-            key_states,
-            cos,
-            sin,
-            position_ids, # Global position IDs (bs, max_seq_len)
-            indices_local, # Local indices mapping back to global flat index
-            max_seqlen_in_batch # Max length in this batch
-        )
+            # Generate cos/sin cache
+            cos, sin = self.rotary_emb(value_states, seq_len=max_seqlen_in_batch)
+            # Flash RoPE needs half dim: (seq_len, rotary_dim / 2)
+            cos = cos[:, :cos.shape[-1] // 2]
+            sin = sin[:, :sin.shape[-1] // 2]
+
+            # Apply RoPE using flash_attn function
+            query_states = apply_rotary_emb_flash(
+                query_states, cos, sin, interleaved=False, inplace=False,
+                cu_seqlens=cu_seqlens_local_init, max_seqlen=max_seqlen_local_init
+            )
+            key_states = apply_rotary_emb_flash(
+                key_states, cos, sin, interleaved=False, inplace=False,
+                cu_seqlens=cu_seqlens_local_init, max_seqlen=max_seqlen_local_init # Use same local info
+            )
+        else:
+            # Fallback: Manual RoPE application (requires padding/unpadding or careful indexing)
+            raise NotImplementedError("Manual RoPE application for unpadded Ring Attention is complex and not implemented as fallback.")
 
         # --- 3. Prepare for Ring Attention ---
         key_states = key_states.contiguous()
@@ -489,7 +426,7 @@ class ParallelLlamaRingAttentionRmPad(nn.Module):
 
             # --- b. Attention Calculation ---
             # Use flash_attn varlen interface if available
-            if _flash_attn_available:
+            if is_flash_attn_2_available():
                 # Calculate local sequence info for the current K/V block
                 (_, cu_seqlens_k_local, max_seqlen_k_local, _, _, _) = \
                     self._pad_local_data(current_key_states, current_indices, cu_seqlens)
