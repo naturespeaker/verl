@@ -29,9 +29,9 @@ from transformers.utils import is_flash_attn_2_available
 from .parallel_linear import QKVParallelLinear
 # Use RoPE implementation compatible with potential Flash Attn usage later
 from .parallel_attention import (
-    LlamaRotaryEmbedding, # Keep base RoPE for now
+    LlamaRotaryEmbedding,
     repeat_kv,
-    rotate_half, # Needed for manual RoPE application
+    rotate_half, # Needed for manual RoPE application if flash_attn is unavailable
 )
 from verl.utils.megatron import tensor_parallel as tp_utils
 
@@ -77,8 +77,8 @@ class ParallelLlamaRingAttentionRmPad(nn.Module):
         assert self.num_key_value_heads % self.tp_size == 0, "num_key_value_heads must be divisible by tp_size for QKVParallelLinear"
 
         self.num_heads_per_tp = self.num_heads // self.tp_size
-        # KV heads are replicated across TP ranks in Megatron's TP strategy for Attention
-        self.num_key_value_heads_per_tp = self.num_key_value_heads
+        # K/V heads are split across TP ranks in this implementation (consistent with QKVParallelLinear)
+        self.num_key_value_heads_per_tp = self.num_key_value_heads // self.tp_size
         self.hidden_size_per_tp = self.hidden_size // self.tp_size
 
         # --- Get Parallelism Kwargs ---
@@ -98,34 +98,23 @@ class ParallelLlamaRingAttentionRmPad(nn.Module):
             num_key_value_heads=self.num_key_value_heads, # Total number of K/V heads
             head_dim=self.head_dim,
             bias=config.attention_bias,
-            gather_output=False, # Keep QKV split across TP ranks for Q
-            skip_bias_add=False, # Assuming skip_bias_add is handled by kwargs or default
+            gather_output=False, # Keep QKV split across TP ranks
+            skip_bias_add=False, # Bias is handled internally or by kwargs
             **column_kwargs,
         )
         # Calculate local sizes based on TP split
         self.q_size = self.num_heads_per_tp * self.head_dim
-        # K and V sizes correspond to the *total* number of KV heads * head_dim,
-        # as they are computed based on the full hidden dim before TP split in QKVParallelLinear
-        # However, the output tensor shape will be split along the hidden dim.
-        # Let's verify the output shape of QKVParallelLinear. It should be (..., q_local + k_local + v_local)
-        # where k_local and v_local correspond to the portion of KV heads handled locally if they were split.
-        # But Megatron usually splits Q and replicates K/V. Let's assume QKVParallelLinear output is split for Q,
-        # and K/V parts correspond to the full KV heads but projected from local hidden_size_per_tp.
-        # We need to confirm the exact output structure of QKVParallelLinear.
-        # Assuming output is (..., q_local_dim + k_total_dim + v_total_dim) split by TP? No, that's complex.
-        # More likely: Output is (..., hidden_qkv_local = (num_q_local + num_kv_local + num_kv_local) * head_dim)
-        # Let's stick to the simpler calculation based on local head counts derived from TP split:
+        # K and V sizes are also based on the local TP partition
         self.k_size = self.num_key_value_heads_per_tp * self.head_dim
         self.v_size = self.num_key_value_heads_per_tp * self.head_dim
-        # Based on QKVParallelLinear analysis, K/V are split, not replicated.
 
         self.o_proj = tensor_parallel.RowParallelLinear( # Output projection
             # Input size should be the local hidden size partition
-            input_size=self.hidden_size_per_tp, # Input is parallel
+            input_size=self.hidden_size, # RowParallelLinear expects full hidden size partitioned locally
             output_size=self.hidden_size, # Output is gathered
             bias=config.attention_bias,
             input_is_parallel=True,
-            skip_bias_add=False,
+            skip_bias_add=False, # Bias is handled internally or by kwargs
             **row_kwargs,
         )
         # --- RoPE ---
@@ -330,15 +319,10 @@ class ParallelLlamaRingAttentionRmPad(nn.Module):
              max_seqlen_in_batch = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
 
         # --- 1. QKV Projection ---
-        # Input: (total_tokens_local, 1, hidden_size_per_tp)
-        # Output from QKVParallelLinear might be packed (total_tokens, 1, q_local+k_local+v_local)
-        # Need to confirm the output shape and split logic based on QKVParallelLinear implementation.
-        # Assuming it outputs packed and we split manually:
-        qkv_output_packed, _ = self.qkv_proj(hidden_states) # Shape (total_tokens_local, 1, q_size + k_size_total + v_size_total ?) -> Check QKVParallelLinear
-        # Let's assume QKVParallelLinear correctly handles TP and gives local Q, K, V parts
-        # Output shape: (total_tokens_local, 1, q_size + k_size + v_size) where sizes are local TP partitions
-        qkv_output_packed = qkv_output_packed.squeeze(1) # -> (total_tokens_local, q+k+v_local_size)
-
+        # Input: (total_tokens_local, 1, hidden_size) -> QKVParallelLinear handles the TP split internally
+        # Output: (total_tokens_local, 1, q_size + k_size + v_size) where sizes are local TP partitions
+        qkv_output_packed, _ = self.qkv_proj(hidden_states)
+        qkv_output_packed = qkv_output_packed.squeeze(1) # -> (total_tokens_local, q_local + k_local + v_local)
         # Split the packed output based on local sizes (Q, K, V are all split by TP)
         query_states, key_states, value_states = qkv_output_packed.split(
              [self.q_size, self.k_size, self.v_size], dim=-1
@@ -487,39 +471,8 @@ class ParallelLlamaRingAttentionRmPad(nn.Module):
             current_value_states = value_recv_buffer
             current_indices = indices_recv_buffer
 
-            # Optional: Explicitly swap buffers if needed
-            # key_recv_buffer, current_key_states = current_key_states, key_recv_buffer
-            # value_recv_buffer, current_value_states = current_value_states, value_recv_buffer
-            # indices_recv_buffer, current_indices = current_indices, indices_recv_buffer
-
-
-        # --- 5. Finalize Attention Output ---
         attn_output = attn_output_accumulator # Shape: (total_tokens_local, num_heads_per_tp, head_dim)
-
-        # Reshape output for RowParallelLinear input
-        # Target shape: (total_tokens_local, hidden_size_per_tp)
         attn_output = attn_output.reshape(total_tokens_local, self.hidden_size_per_tp)
-
-        # --- 6. Output Projection ---
-        # Input: (total_tokens_local, hidden_size_per_tp)
-        # Output from RowParallelLinear is gathered if sequence_parallel=False
-        # Output shape: (total_tokens_local, hidden_size)
         output, bias = self.o_proj(attn_output) # Bias is likely None or added inside
-
-        # --- 7. Reshape output to match original format ---
-        # Input was (total_tokens_local, 1, hidden_size_per_tp)
-        # Output should be (total_tokens_local, 1, hidden_size_per_tp) after SP reduction if enabled,
-        # or (total_tokens_local, 1, hidden_size) if gathered.
-        # Since o_proj gathers (assuming SP=False for RowParallelLinear output gathering),
-        # we need to scatter it back if SP is enabled for the output.
-        # This scatter should happen *outside* this layer, in the main transformer block.
-        # So, the output here should be (total_tokens_local, hidden_size)
-        # We add the middle dimension back.
         output = output.unsqueeze(1) # -> (total_tokens_local, 1, hidden_size)
-
-        # If SP is enabled, the output projection in the transformer block will handle the reduce-scatter.
-        # If SP is disabled, this gathered output is correct.
-
-        # Return bias if it exists and needs to be handled separately
-        # return output, bias # If bias is handled outside o_proj
         return output # Assuming bias is handled by o_proj or not used
