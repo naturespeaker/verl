@@ -490,9 +490,8 @@ class MegatronSFTTrainer:
         # --- Megatron Optimizer ---
         # Use Megatron's optimizer function. It handles parameter grouping for weight decay.
         # Pass the DDP-wrapped model (which might contain PEFT model inside).
-        # !!! USER ACTION REQUIRED: Verify if `get_megatron_optimizer` correctly handles PEFT models !!!
-        # It should ideally only consider parameters where `param.requires_grad is True`.
-        print_rank_0("Attempting to build optimizer using get_megatron_optimizer. VERIFY that it correctly handles PEFT parameters.")
+        # Assuming `get_megatron_optimizer` correctly handles PEFT models (only optimizes `requires_grad=True` params).
+        print_rank_0("Building optimizer using get_megatron_optimizer...")
 
         # Create Megatron OptimizerConfig from Hydra config and Megatron args
         # Map relevant fields. Ensure defaults or values from args are used where appropriate.
@@ -603,26 +602,33 @@ class MegatronSFTTrainer:
             iteration = load_checkpoint(self.model, self.optimizer, self.lr_scheduler)
             if iteration > 0:
                 print_rank_0(f"Loaded Base Model/Optimizer/Scheduler state from Megatron checkpoint at iteration {iteration}")
-                # !!! USER ACTION REQUIRED: Implement LoRA adapter loading !!!
-                # If resuming LoRA training, load the adapter weights *after* the base model is loaded.
-                # Example:
-                # if model_config.get("lora_rank", 0) > 0:
-                #     lora_checkpoint_path = os.path.join(self.args.load, f"iter_{iteration:07d}", "lora_adapter")
-                #     if os.path.exists(lora_checkpoint_path):
-                #         print_rank_0(f"Attempting to load LoRA adapter from: {lora_checkpoint_path}")
-                #         # Ensure the model is already a PeftModel before loading adapters
-                #         peft_model_to_load = self.model.module if isinstance(self.model, DDP) else self.model # Access underlying model
-                #         if isinstance(peft_model_to_load, PeftModel):
-                #             peft_model_to_load.load_adapter(lora_checkpoint_path, adapter_name="default") # Or the name used during saving
-                #             print_rank_0("LoRA adapter loaded successfully.")
-                #         else:
-                #             print_rank_0("ERROR: Model is not a PeftModel instance, cannot load LoRA adapter.")
-                #     else:
-                #         print_rank_0(f"WARNING: LoRA checkpoint path not found: {lora_checkpoint_path}")
+                # Load LoRA adapter weights if resuming LoRA training
+                if model_config.get("lora_rank", 0) > 0:
+                    # Construct the expected path for LoRA adapters within the Megatron checkpoint iteration directory
+                    lora_checkpoint_path = os.path.join(self.args.load, f"iter_{iteration:07d}", "lora_adapter")
+                    if os.path.exists(lora_checkpoint_path):
+                        print_rank_0(f"Attempting to load LoRA adapter from: {lora_checkpoint_path}")
+                        # Access the underlying model, handling potential DDP wrapping
+                        peft_model_to_load = self.model.module if hasattr(self.model, 'module') and isinstance(self.model.module, PeftModel) else None
+                        if peft_model_to_load is None and isinstance(self.model, PeftModel): # Check if model itself is PEFT
+                             peft_model_to_load = self.model
+
+                        if peft_model_to_load and isinstance(peft_model_to_load, PeftModel):
+                            try:
+                                # Load the adapter weights into the existing PeftModel
+                                peft_model_to_load.load_adapter(lora_checkpoint_path, adapter_name="default") # Use "default" or the name used during saving
+                                print_rank_0("LoRA adapter loaded successfully.")
+                            except Exception as e:
+                                print_rank_0(f"ERROR: Failed to load LoRA adapter from {lora_checkpoint_path}: {e}")
+                        else:
+                            # This case should ideally not happen if LoRA was configured correctly during init
+                            print_rank_0("ERROR: LoRA is configured, checkpoint exists, but could not find PeftModel instance to load adapter into.")
+                    else:
+                        # This might be expected if it's the first time saving LoRA or if the adapter wasn't saved previously
+                        print_rank_0(f"INFO: LoRA adapter checkpoint path not found, skipping adapter loading: {lora_checkpoint_path}")
             else: # Corresponds to `if iteration > 0:`
                 print_rank_0("No Megatron checkpoint state found or starting from iteration 0. Starting training from scratch (or base weights).")
                 iteration = 0 # Ensure iteration is 0 if no checkpoint loaded
-        else:
             # Indent iteration assignment under this else
             iteration = 0 # Start from beginning
         # Ensure this assignment is aligned with the if/else block starting at L485
@@ -918,13 +924,7 @@ class MegatronSFTTrainer:
             )
 
             for step_in_epoch in progress_bar: # step_in_epoch is 0-based index within the epoch
-                # --- Megatron Train Step (Placeholder) ---
-                # This might replace the manual batch fetching and training_step call
-                # loss_dict = train_step(...)
-                # train_metrics = {"train/loss": loss_dict['lm_loss'].item(), ...}
-                # --- End Megatron Train Step ---
-
-                # --- Standard PyTorch Train Step ---
+                # --- Standard PyTorch Train Step (which calls Megatron's train_step internally) ---
                 try:
                     # TODO: Handle gradient accumulation steps if needed
                     batch = next(train_iter)
@@ -996,7 +996,8 @@ class MegatronSFTTrainer:
         save_checkpoint(iteration=iteration,
                         model=self.model, # Pass DDP-wrapped model
                         optimizer=self.optimizer,
-                        opt_param_scheduler=self.lr_scheduler)
+                        opt_param_scheduler=self.lr_scheduler,
+                        num_floating_point_operations_so_far=num_floating_point_operations_so_far_placeholder,) # Add missing client_state argument
         print_rank_0(f"Megatron state saved for iteration {iteration}.")
         # --- End Megatron Checkpoint Saving ---
 
@@ -1058,29 +1059,29 @@ class MegatronSFTTrainer:
 
 
 # Example main entry point (adapt as needed, e.g., using Hydra)
-# import hydra
-# from omegaconf import DictConfig, OmegaConf
+import hydra
+from omegaconf import DictConfig, OmegaConf
 
-# @hydra.main(config_path="config", config_name="megatron_sft_config", version_base=None)
-# def main(cfg: DictConfig):
-#     print_rank_0("Starting Megatron SFT Training...")
-#     print_rank_0(OmegaConf.to_yaml(cfg))
+@hydra.main(config_path="config", config_name="megatron_sft_config", version_base=None)
+def main(cfg: DictConfig):
+    print_rank_0("Starting Megatron SFT Training...")
+    print_rank_0(OmegaConf.to_yaml(cfg))
 
-#     # --- Megatron Initialization Call (Placeholder) ---
-#     # This needs to happen *before* the Trainer is initialized if Megatron handles
-#     # distributed setup globally.
-#     # initialize_megatron(args_defaults=...) # Pass relevant args from cfg
-#     # --- End Megatron Initialization Call ---
+    # --- Megatron Initialization Call (Placeholder) ---
+    # This needs to happen *before* the Trainer is initialized if Megatron handles
+    # distributed setup globally.
+    # initialize_megatron(args_defaults=...) # Pass relevant args from cfg
+    # --- End Megatron Initialization Call ---
 
-#     # Ensure CUDA device is set after potential Megatron init
-#     if dist.is_initialized():
-#          torch.cuda.set_device(dist.get_rank())
+    # Ensure CUDA device is set after potential Megatron init
+    if dist.is_initialized():
+         torch.cuda.set_device(dist.get_rank())
 
-#     # Create and run the trainer
-#     trainer = MegatronSFTTrainer(cfg)
-#     trainer.fit()
-#     print_rank_0("Training finished successfully.")
+    # Create and run the trainer
+    trainer = MegatronSFTTrainer(cfg)
+    trainer.fit()
+    print_rank_0("Training finished successfully.")
 
-# if __name__ == "__main__":
-#     # main() # Uncomment to run with Hydra
-#     pass # Add main execution logic here
+if __name__ == "__main__":
+    # main() # Uncomment to run with Hydra
+    pass # Add main execution logic here
