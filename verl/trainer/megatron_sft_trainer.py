@@ -34,15 +34,18 @@ import torch.distributed as dist
 # === Megatron-LM Imports (!!! USER ACTION REQUIRED: Adjust these imports based on your Megatron library structure !!!) ===
 # Assuming these are standard Megatron-Core or similar imports - VERIFY PATHS
 from megatron.core.models.gpt.gpt_model import GPTModel # Example, adjust to your model class (e.g., Llama specific) # PYLINT_IGNORE: import-error, no-name-in-module
-from megatron.training import get_args, print_rank_0, get_tokenizer, get_model # PYLINT_IGNORE: import-error, no-name-in-module
+# from megatron.training import get_model # Replaced below PYLINT_IGNORE: import-error, no-name-in-module
+from verl.utils.megatron_utils import get_model # Use our utility function
+from megatron.training import get_args, print_rank_0, get_tokenizer # PYLINT_IGNORE: import-error, no-name-in-module
 from megatron.training.initialize import initialize_megatron # PYLINT_IGNORE: import-error, no-name-in-module
 from megatron.training.arguments import core_transformer_config_from_args # PYLINT_IGNORE: import-error, no-name-in-module
 from megatron.core.transformer.transformer_config import TransformerConfig # PYLINT_IGNORE: import-error, no-name-in-module
-# Corrected DDP import for Megatron-Core
-from megatron.core.distributed import DistributedDataParallel as DDP # PYLINT_IGNORE: import-error, no-name-in-module
+# Corrected DDP import for Megatron-Core and add DistributedDataParallelConfig
+from megatron.core.distributed import DistributedDataParallel as DDP, DistributedDataParallelConfig # PYLINT_IGNORE: import-error, no-name-in-module
 # Attempting core import for optimizer helper - VERIFY THIS PATH
-from megatron.core.optimizer import get_megatron_optimizer # PYLINT_IGNORE: import-error, no-name-in-module
-# from megatron.core.optimizer import OptimizerConfig # If using core config # PYLINT_IGNORE: import-error, no-name-in-module
+from verl.utils.megatron.optimizer import get_megatron_optimizer
+# Import OptimizerConfig - Assuming path is correct, adjust if needed
+from megatron.core.optimizer.optimizer_config import OptimizerConfig # PYLINT_IGNORE: import-error, no-name-in-module
 # Attempting core import for scheduler - VERIFY THIS PATH
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler # PYLINT_IGNORE: import-error, no-name-in-module
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint # PYLINT_IGNORE: import-error, no-name-in-module # Assuming checkpointing remains in training
@@ -56,7 +59,9 @@ from tqdm import tqdm
 from peft import LoraConfig, TaskType, get_peft_model, PeftModel # Added for LoRA and type checking
 # Use Megatron's tokenizer or HF's AutoTokenizer if compatible
 # from transformers import AutoTokenizer
-
+from transformers import LlamaConfig # Added for config creation
+# Model instantiation will be handled by init_mcore_model
+from verl.models.mcore import init_mcore_model # Import the helper function
 # verl imports
 import verl.utils.hdfs_io as hdfs_io
 from verl.utils.dataset import SFTDataset # Or MultiTurnSFTDataset, or custom
@@ -285,142 +290,197 @@ class MegatronSFTTrainer:
         print_rank_0("Building model, optimizer, and scheduler...")
         model_config = self.config.model
         optim_config = self.config.optim
+        args = self.args # Megatron args
+
+        # --- Prepare HuggingFace and Megatron Configs ---
+        print_rank_0("Creating HuggingFace LlamaConfig and Megatron TransformerConfig...")
+        # Create LlamaConfig from Megatron args (mapping might need adjustment)
+        # Ensure all necessary fields are present in args or provide defaults
+        hf_config = LlamaConfig(
+             vocab_size=args.padded_vocab_size,
+             hidden_size=args.hidden_size,
+             intermediate_size=args.ffn_hidden_size,
+             num_hidden_layers=args.num_layers,
+             num_attention_heads=args.num_attention_heads,
+             num_key_value_heads=getattr(args, 'num_key_value_heads', args.num_attention_heads), # Default to num_attention_heads if GQA not specified
+             hidden_act=getattr(args, 'ffn_hidden_act', "silu"), # Use getattr for safer access
+             max_position_embeddings=args.max_position_embeddings,
+             initializer_range=getattr(args, 'init_method_std', 0.02), # Default if not present
+             rms_norm_eps=getattr(args, 'norm_epsilon', 1e-6), # Default if not present
+             use_cache=False,
+             pad_token_id=self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id,
+             bos_token_id=self.tokenizer.bos_token_id,
+             eos_token_id=self.tokenizer.eos_token_id,
+             tie_word_embeddings=not getattr(args, 'untie_embeddings_and_output_weights', True), # Default untie=True -> tie=False
+             rope_theta=getattr(args, 'rope_theta', 10000.0),
+             rope_scaling=getattr(args, 'rope_scaling', None),
+             attention_bias=getattr(args, 'add_bias_linear', False), # Default no bias
+        )
+        # Get Megatron's TransformerConfig (used by init_mcore_model and potentially DDP)
+        megatron_transformer_config = core_transformer_config_from_args(args)
+        self.megatron_transformer_config = megatron_transformer_config # Store for later use
+        print_rank_0(f"Created LlamaConfig: {hf_config}")
+        print_rank_0(f"Created Megatron TransformerConfig: {megatron_transformer_config}")
+        # --- End Config Preparation ---
+
 
         # --- Megatron Model Loading ---
         # Use Megatron's get_model, which typically takes a model_provider function.
-        # The model_provider should return an instance of the Megatron model (e.g., GPTModel).
-        # We assume a helper `get_model_provider` exists in `verl.utils.megatron_utils`
-        # that handles config mapping and returns the correct provider function.
-        # !!! USER ACTION REQUIRED: Define or import the correct model_provider function here !!!
-        # Example placeholder function:
         def model_provider(pre_process=True, post_process=True):
              """
-             Build the model architecture (placeholder).
-
-             !!! USER ACTION REQUIRED !!!
-             This function MUST be implemented to return an instance of the correct
-             Megatron model class based on your configuration (e.g., Llama, DeepSeek).
-             It should use `self.args` (derived from the Hydra config during init)
-             to determine model parameters and architecture.
-             The actual checkpoint weights specified in `config.model.partial_pretrain`
-             (mapped to `self.args.load`) will be loaded into this architecture by
-             Megatron's `get_model` function later.
+             Build the Megatron model using init_mcore_model helper.
+             Relies on hf_config and megatron_transformer_config defined in the outer scope.
              """
-             print_rank_0('Building Megatron model architecture (using placeholder provider)...')
-             megatron_transformer_config: TransformerConfig = core_transformer_config_from_args(self.args) # PYLINT_IGNORE: name-error (Import added)
-
-             # Example logic (replace with your actual implementation):
-             # !!! NOTE: Pylint errors regarding missing arguments for GPTModel constructor
-             # are expected here as this is a placeholder. USER ACTION REQUIRED: Implement the
-             # correct model instantiation based on 'model_type' below.
-             model_type = self.config.model.get("type", "llama") # Get model type from Hydra config
-             print_rank_0(f"Attempting to build model of type: {model_type}")
- 
-             # !!! USER ACTION REQUIRED: Replace the following placeholder logic with your actual model loading !!!
-             if model_type == "llama":
-                 # Example: Import and instantiate your Llama model class
-                 # from verl.models.llama.megatron import LlamaModel # Adjust import path
-                 # model = LlamaModel(config=megatron_transformer_config, ...)
-                 raise NotImplementedError("Placeholder: Llama model instantiation not implemented in model_provider.")
-             elif model_type == "deepseek":
-                 # Example: Import and instantiate your DeepSeek model class
-                 # from verl.models.deepseek.megatron import DeepSeekModel # Adjust import path
-                 # model = DeepSeekModel(config=megatron_transformer_config, ...)
-                 raise NotImplementedError("Placeholder: DeepSeek model instantiation not implemented in model_provider.")
-             elif model_type == "gpt": # Fallback to generic GPT for example
-                 print_rank_0("Warning: Falling back to generic GPTModel placeholder in model_provider.")
-                 model = GPTModel(
-                     config=megatron_transformer_config,
-                     parallel_output=True,
-                     pre_process=pre_process,
-                     post_process=post_process
-                 )
-             else:
-                 raise ValueError(f"Unsupported model type '{model_type}' specified in config.")
-
-             return model
+             print_rank_0('Building Megatron model using init_mcore_model...')
+             # Assuming init_mcore_model handles model type selection based on config
+             parallel_model = init_mcore_model(
+                 megatron_transformer_config, # Pass Megatron config
+                 hf_config,                   # Pass HF config
+                 pre_process,
+                 post_process,
+                 # share_embeddings_and_output_weights= not getattr(args, 'untie_embeddings_and_output_weights', True), # Align with hf_config
+                 value=False, # Assuming SFT is not a value model
+             )
+             # init_mcore_model might not move to CUDA, ensure it happens if needed
+             # parallel_model.cuda() # get_model might handle device placement
+             return parallel_model
         # --- End model_provider Definition ---
 
-        # Get the Megatron transformer config
-        megatron_transformer_config = core_transformer_config_from_args(self.args)
+        # `get_model` handles model instantiation using our provider and potentially loading checkpoints
+        # Pass the implemented provider. The megatron_transformer_config is often implicitly used by get_model
+        # for things like DDP wrapping, so we don't pass it directly here.
+        # Based on worker example, get_model might handle DDP wrapping if wrap_with_ddp=True is passed.
+        # Check if wrap_with_ddp is available/needed in your Megatron version's get_model.
+        # wrap_ddp_in_get_model = True # Set based on get_model behavior
+        # Call our utility get_model, explicitly disable DDP wrapping (wrap_with_ddp=False).
+        # We do this because PEFT needs to be applied to the raw model *before* DDP wrapping.
+        # We will manually wrap with DDP later.
+        # Assuming get_model with wrap_with_ddp=False returns the raw model instance(s).
+        # It might return a list for pipeline parallelism.
+        print_rank_0("Calling get_model with wrap_with_ddp=False to get raw model...")
+        returned_value = get_model(
+            model_provider_func=model_provider,
+            wrap_with_ddp=False, # Get the raw model before PEFT/DDP
+            # Pass use_distributed_optimizer setting, needed by internal DDP logic if it were enabled,
+            # but also good practice to pass relevant args. Check if get_model uses it otherwise.
+            use_distributed_optimizer=getattr(self.args, 'use_distributed_optimizer', True)
+        )
 
-        # `get_model` handles model instantiation and potentially loading checkpoints
-        # if `self.args.load` is set. It returns a list of models for pipeline parallelism.
-        # For non-pipeline models, it's usually a list with one element.
-        # Removed incorrect 'config' argument from get_model call
-        model_list = get_model(model_provider)
-        if len(model_list) == 1:
-             self.model = model_list[0]
+        # Handle return type: get_model might return a list (for PP) or a single module
+        if isinstance(returned_value, list):
+            if len(returned_value) == 1:
+                # Non-PP case, single model chunk in a list
+                self.model = returned_value[0]
+                print_rank_0("get_model returned a single model instance (in a list).")
+            else:
+                # PP case - This trainer doesn't fully support PP yet.
+                raise NotImplementedError("Pipeline Parallelism model handling not fully implemented in this trainer.")
+        elif isinstance(returned_value, torch.nn.Module):
+            # Direct module return (non-PP case)
+            self.model = returned_value
+            print_rank_0("get_model returned a single model instance.")
         else:
-             # Handle pipeline parallelism if necessary (requires more complex setup)
-             raise NotImplementedError("Pipeline Parallelism model handling not fully implemented in this trainer.")
-             # self.model = model_list # Keep as list for pipeline stages
+            raise TypeError(f"Unexpected return type from get_model: {type(returned_value)}")
 
-        print_rank_0(f"Megatron model ({type(self.model).__name__}) built.")
-        # Note: Checkpoint loading is typically handled inside `get_model` or `setup_model_and_optimizer`
-        # based on `self.args.load`. We might not need the explicit load call here.
+        print_rank_0(f"Raw Megatron model ({type(self.model).__name__}) received.")
         # --- End Megatron Model Loading ---
 
 
-        # Apply LoRA if configured
+        # --- Apply LoRA (Target modules remain the same) ---
         if model_config.get("lora_rank", 0) > 0:
             print_rank_0(f"Applying LoRA with rank {model_config.lora_rank}")
-            # Determine target modules for Megatron Llama (needs inspection of the model structure)
-            # Example: target_modules = ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"] # Common Megatron names
-            # !!! USER ACTION REQUIRED: Verify these target modules match YOUR Megatron Llama implementation !!!
-            # Inspect your model architecture (e.g., print(self.model) before PEFT wrapping) to find the correct names.
-            # Common HF Llama targets: ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-            # Megatron might use different names like "query_key_value", "dense", "attention.dense", "mlp.dense_h_to_4h", etc.
-            # Using common Megatron names as default, VERIFY THESE:
-            default_targets = ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"]
-            target_modules_config = model_config.get("target_modules", default_targets)
-            # Convert Hydra ListConfig to regular list if necessary
-            target_modules = convert_to_regular_types(target_modules_config)
-            print_rank_0(f"Using LoRA target modules (VERIFY THESE): {target_modules}")
+            target_modules = ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"] # Still based on Llama structure
+            print_rank_0(f"Using LoRA target modules: {target_modules}")
 
             lora_config = LoraConfig(
-                task_type=TaskType.CAUSAL_LM, # Assuming Causal LM task
+                task_type=TaskType.CAUSAL_LM,
                 r=model_config.lora_rank,
                 lora_alpha=model_config.lora_alpha,
-                target_modules=target_modules, # Use converted list
+                target_modules=target_modules,
                 lora_dropout=model_config.get("lora_dropout", 0.0),
                 bias="none",
-                # modules_to_save: Add if training embeddings/lm_head with LoRA
-                # modules_to_save=["embed_tokens", "lm_head"] if model_config.get("lora_train_embedding") else None,
             )
 
             # Ensure input grads are enabled for LoRA
-            self.model.enable_input_require_grads() # Uncommented
+            # Check if the model returned by init_mcore_model needs this
+            # Access the underlying model if it's already wrapped by get_model
+            model_to_check = self.model.module if hasattr(self.model, 'module') else self.model # Handle potential DDP wrap by get_model
 
-            self.model = get_peft_model(self.model, lora_config)
+            if hasattr(model_to_check, 'enable_input_require_grads'):
+                 model_to_check.enable_input_require_grads()
+                 print_rank_0("Enabled input require grads for LoRA.")
+
+            # Apply PEFT to the potentially unwrapped model
+            self.model = get_peft_model(model_to_check, lora_config)
             print_rank_0("PEFT model created.")
             self.model.print_trainable_parameters()
+        # --- End LoRA ---
+
 
         # --- Megatron Model Parallel Wrapping ---
         # Wrap the model (potentially PEFT-modified) with Megatron's DDP.
-        # `setup_model_and_optimizer` might handle this, or we do it manually.
-        # Manual wrapping:
-        self.model = DDP(
-            config=megatron_transformer_config, # Pass Megatron config
-            model=self.model,
-            # data_parallel_group=self.args.data_parallel_group, # Usually inferred
-            # gradient_accumulation_fusion=self.args.gradient_accumulation_fusion # Usually inferred
+        # If get_model didn't handle DDP wrapping (e.g., wrap_with_ddp=False or not supported),
+        # we need to wrap it manually. Check if self.model is already wrapped.
+        # Note: self.model might be the PEFT model now if LoRA was applied
+        # --- Manual DDP Wrapping ---
+        # Now, wrap the potentially PEFT-modified model with Megatron DDP manually.
+        # This is necessary because we called get_model with wrap_with_ddp=False.
+        print_rank_0("Manually wrapping model (potentially PEFT-modified) with Megatron DDP...")
+
+        # Create the DDP configuration object, mirroring verl/utils/megatron_utils.py
+        # Need to get use_distributed_optimizer from args
+        use_distributed_optimizer = getattr(self.args, 'use_distributed_optimizer', True)
+        ddp_config = DistributedDataParallelConfig(
+             overlap_grad_reduce=getattr(self.args, 'overlap_grad_reduce', False), # Get from args or default
+             use_distributed_optimizer=use_distributed_optimizer,
+             grad_reduce_in_fp32=getattr(self.args, 'accumulate_allreduce_grads_in_fp32', True) # Get from args or default
         )
-        print_rank_0("Wrapped model with Megatron DDP.")
-        # --- End Megatron Model Parallel Wrapping ---
+        print_rank_0(f"Using DDP Config: {ddp_config}")
+
+        # Correct DDP constructor call for megatron-core, requires module, config, and ddp_config
+        self.model = DDP(
+            module=self.model, # Pass the potentially PEFT-wrapped model
+            config=megatron_transformer_config, # Pass the TransformerConfig
+            ddp_config=ddp_config, # Pass the specific DDP config
+            # disable_bucketing can be True if model is single chunk (non-PP)
+            disable_bucketing=True # Explicitly set assuming non-PP based on earlier checks
+        )
+        print_rank_0("Model successfully wrapped with Megatron DDP.")
+
+        # Broadcast params after manual DDP wrapping, similar to get_model's internal logic
+        # Check if self.model is now a list (it shouldn't be based on above logic) or single DDP instance
+        if isinstance(self.model, DDP):
+             print_rank_0("Broadcasting parameters for manually wrapped DDP model...")
+             self.model.broadcast_params()
+        else:
+             print_rank_0("[Warning] Model after DDP wrapping is not a DDP instance? Skipping broadcast.")
+
+
 
         # Enable gradient checkpointing
         # PEFT handles GC wrapping if LoRA is used and GC is enabled in the base model config or PEFT config.
         # If not using LoRA, enable Megatron's or HF's native GC here.
         if model_config.enable_gradient_checkpointing:
-            # Check if PEFT already enabled it
-            already_enabled = getattr(self.model.config, "gradient_checkpointing", False) or \
-                              (hasattr(self.model, "is_gradient_checkpointing") and self.model.is_gradient_checkpointing)
+            # Access the underlying model correctly (could be PeftModel wrapped in DDP)
+            model_to_check_gc = self.model.module if isinstance(self.model, DDP) else self.model
+            # Check config of the base model if PEFT is used
+            base_model_for_config = model_to_check_gc.model if isinstance(model_to_check_gc, PeftModel) else model_to_check_gc
+            base_model_config = getattr(base_model_for_config, 'config', None) # Get config safely
+
+            already_enabled = False
+            if base_model_config:
+                 already_enabled = getattr(base_model_config, "gradient_checkpointing", False)
+            # Also check the wrapper model's state if possible
+            already_enabled = already_enabled or \
+                              (hasattr(model_to_check_gc, "is_gradient_checkpointing") and model_to_check_gc.is_gradient_checkpointing)
 
             if not already_enabled:
-                 # Enable it on the base model (or PEFT model if it supports it directly)
-                 self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False}) # HF style
-                 print_rank_0("Gradient checkpointing enabled (explicitly).")
+                 # Enable it on the potentially PEFT-wrapped model
+                 if hasattr(model_to_check_gc, 'gradient_checkpointing_enable'):
+                      model_to_check_gc.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False}) # HF style
+                      print_rank_0("Gradient checkpointing enabled (explicitly).")
+                 else:
+                      print_rank_0("Warning: Model does not have gradient_checkpointing_enable method.")
             else:
                  print_rank_0("Gradient checkpointing already enabled (likely by PEFT or base config).")
 
@@ -429,47 +489,88 @@ class MegatronSFTTrainer:
         print_rank_0("Building optimizer...")
         # --- Megatron Optimizer ---
         # Use Megatron's optimizer function. It handles parameter grouping for weight decay.
-        # It expects the model *before* DDP wrapping if creating groups manually,
-        # but `get_megatron_optimizer` might handle the DDP-wrapped model directly.
-        # Check Megatron's documentation for the specific version.
+        # Pass the DDP-wrapped model (which might contain PEFT model inside).
         # !!! USER ACTION REQUIRED: Verify if `get_megatron_optimizer` correctly handles PEFT models !!!
         # It should ideally only consider parameters where `param.requires_grad is True`.
-        # If it doesn't automatically handle this for PEFT models, you might need to filter parameters manually:
-        # trainable_params = filter(lambda p: p.requires_grad, self.model.parameters())
-        # self.optimizer = get_megatron_optimizer(trainable_params) # Or adapt get_megatron_optimizer
-        # Assuming `get_megatron_optimizer` works correctly with the DDP-wrapped PEFT model for now:
         print_rank_0("Attempting to build optimizer using get_megatron_optimizer. VERIFY that it correctly handles PEFT parameters.")
-        self.optimizer = get_megatron_optimizer(self.model)
+
+        # Create Megatron OptimizerConfig from Hydra config and Megatron args
+        # Map relevant fields. Ensure defaults or values from args are used where appropriate.
+        megatron_optimizer_config = OptimizerConfig(
+            optimizer=getattr(self.args, 'optimizer', 'adam'), # Default to adam if not in args
+            lr=self.args.lr,
+            weight_decay=self.args.weight_decay,
+            adam_beta1=self.args.adam_beta1,
+            adam_beta2=self.args.adam_beta2,
+            adam_eps=self.args.adam_eps,
+            use_distributed_optimizer=getattr(self.args, 'use_distributed_optimizer', True),
+            fp16=self.args.fp16,
+            bf16=self.args.bf16,
+            params_dtype=self.args.params_dtype,
+            # Add other relevant fields if needed, e.g., grad_sync_dtype
+            # grad_sync_dtype=getattr(self.args, 'grad_sync_dtype', self.args.params_dtype)
+        )
+        print_rank_0(f"Created Megatron OptimizerConfig: {megatron_optimizer_config}")
+
+        # Pass the DDP-wrapped model as a list for the 'model_chunks' argument,
+        # and the created OptimizerConfig for the 'config' argument.
+        self.optimizer = get_megatron_optimizer(
+            model=self.model, # Pass model as a single-element list
+            config=megatron_optimizer_config
+        )
         # --- End Megatron Optimizer ---
         print_rank_0(f"Optimizer built: {type(self.optimizer).__name__}")
 
 
         # Build Learning Rate Scheduler
         print_rank_0("Building LR scheduler...")
-        # Calculate steps considering gradient accumulation if Megatron uses it
-        grad_accum_steps = self.args.gradient_accumulation_steps
+        # Calculate steps considering gradient accumulation
+        grad_accum_steps = getattr(self.args, 'gradient_accumulation_steps', 1) # Default if not present
         self.steps_per_epoch = len(self.train_dataloader) // grad_accum_steps
-        self.total_steps = self.steps_per_epoch * self.config.trainer.total_epochs
-        num_warmup_steps = int(self.total_steps * optim_config.warmup_steps_ratio)
+        # Determine total steps based on config priority: train_iters > total_training_steps > epochs
+        if getattr(self.args, 'train_iters', None):
+             self.total_steps = self.args.train_iters
+             print_rank_0(f"Using train_iters from Megatron args: {self.total_steps}")
+        elif self.config.trainer.get("total_training_steps"):
+             self.total_steps = self.config.trainer.total_training_steps
+             print_rank_0(f"Using total_training_steps from Hydra config: {self.total_steps}")
+        else:
+             self.total_steps = self.steps_per_epoch * self.config.trainer.total_epochs
+             print_rank_0(f"Calculating total_steps based on epochs: {self.total_steps}")
+
+        # Determine warmup steps: Use lr_warmup_iters if available, else calculate from ratio
+        num_warmup_steps = getattr(self.args, 'lr_warmup_iters', None)
+        if num_warmup_steps is None:
+             # Ensure optim_config.warmup_steps_ratio exists or provide default
+             warmup_ratio = getattr(optim_config, 'warmup_steps_ratio', 0.0)
+             num_warmup_steps = int(self.total_steps * warmup_ratio)
+             print_rank_0(f"Calculating warmup_steps based on ratio ({warmup_ratio}): {num_warmup_steps}")
+        else:
+             print_rank_0(f"Using lr_warmup_iters from Megatron args: {num_warmup_steps}")
+
+        # Determine decay steps: Use lr_decay_iters if available, else use total_steps
+        lr_decay_steps = getattr(self.args, 'lr_decay_iters', self.total_steps)
+        print_rank_0(f"Using lr_decay_steps: {lr_decay_steps}")
+
         print_rank_0(f"Grad accum steps: {grad_accum_steps}, Steps per epoch: {self.steps_per_epoch}")
-        print_rank_0(f"Total steps: {self.total_steps}, Warmup steps: {num_warmup_steps}")
+        print_rank_0(f"Total steps: {self.total_steps}, Warmup steps: {num_warmup_steps}, Decay steps: {lr_decay_steps}")
 
         # --- Megatron LR Scheduler ---
-        # Megatron's scheduler is often integrated with the optimizer or obtained separately.
-        # `OptimizerParamScheduler` is common.
+        # `OptimizerParamScheduler` is common. Use getattr for safer access to args. Add init_lr.
         self.lr_scheduler = OptimizerParamScheduler(
              optimizer=self.optimizer,
+             init_lr=self.args.lr, # Added init_lr
              max_lr=self.args.lr,
-             min_lr=self.args.min_lr,
-             lr_warmup_steps=self.args.lr_warmup_iters, # Use iters if available
-             lr_decay_steps=self.args.lr_decay_iters,   # Use iters if available
+             min_lr=getattr(self.args, 'min_lr', 0.0), # Default if not present
+             lr_warmup_steps=num_warmup_steps, # Use calculated/provided warmup steps
+             lr_decay_steps=lr_decay_steps,   # Use calculated/provided decay steps
              lr_decay_style=self.args.lr_decay_style,
-             start_wd=self.args.start_weight_decay,
-             end_wd=self.args.end_weight_decay,
-             wd_incr_steps=self.args.wd_incr_steps,
-             wd_incr_style=self.args.wd_incr_style,
-             use_checkpoint_opt_param_scheduler=self.args.use_checkpoint_opt_param_scheduler,
-             override_opt_param_scheduler=self.args.override_opt_param_scheduler
+             start_wd=getattr(self.args, 'start_weight_decay', 0.0), # Default if not present
+             end_wd=getattr(self.args, 'end_weight_decay', self.args.weight_decay), # Default if not present
+             wd_incr_steps=getattr(self.args, 'wd_incr_steps', lr_decay_steps), # Default if not present
+             wd_incr_style=getattr(self.args, 'wd_incr_style', 'linear'), # Default if not present
+             use_checkpoint_opt_param_scheduler=getattr(self.args, 'use_checkpoint_opt_param_scheduler', False), # Default if not present
+             override_opt_param_scheduler=getattr(self.args, 'override_opt_param_scheduler', False) # Default if not present
         )
         # --- End Megatron LR Scheduler ---
         print_rank_0(f"LR Scheduler built: {self.args.lr_decay_style}")
@@ -493,7 +594,6 @@ class MegatronSFTTrainer:
             # `load_checkpoint` loads model, optimizer, and scheduler states
             # It's often called implicitly by `get_model` or `setup_model_and_optimizer`
             # If manual loading is needed:
-            # If manual loading is needed:
             # NOTE: Loading LoRA adapters requires separate handling. Megatron's `load_checkpoint`
             # loads the base model and potentially optimizer/scheduler state.
             # LoRA adapters need to be loaded *after* the base model is loaded and *before*
@@ -511,9 +611,8 @@ class MegatronSFTTrainer:
                 #     if os.path.exists(lora_checkpoint_path):
                 #         print_rank_0(f"Attempting to load LoRA adapter from: {lora_checkpoint_path}")
                 #         # Ensure the model is already a PeftModel before loading adapters
-                #         if isinstance(self.model, PeftModel) or (hasattr(self.model, 'module') and isinstance(self.model.module, PeftModel)):
-                #             # Access the underlying PeftModel instance correctly (might need adjustment based on DDP wrapper)
-                #             peft_model_to_load = self.model.module if hasattr(self.model, 'module') else self.model
+                #         peft_model_to_load = self.model.module if isinstance(self.model, DDP) else self.model # Access underlying model
+                #         if isinstance(peft_model_to_load, PeftModel):
                 #             peft_model_to_load.load_adapter(lora_checkpoint_path, adapter_name="default") # Or the name used during saving
                 #             print_rank_0("LoRA adapter loaded successfully.")
                 #         else:
@@ -522,13 +621,13 @@ class MegatronSFTTrainer:
                 #         print_rank_0(f"WARNING: LoRA checkpoint path not found: {lora_checkpoint_path}")
             else: # Corresponds to `if iteration > 0:`
                 print_rank_0("No Megatron checkpoint state found or starting from iteration 0. Starting training from scratch (or base weights).")
+                iteration = 0 # Ensure iteration is 0 if no checkpoint loaded
         else:
             # Indent iteration assignment under this else
             iteration = 0 # Start from beginning
         # Ensure this assignment is aligned with the if/else block starting at L485
-        self.start_step = iteration * self.args.gradient_accumulation_steps # Adjust starting step based on loaded iteration
-
-    # Ensure this method definition is aligned with other methods like `_build_model_optimizer_scheduler`
+        # Calculate start_step based on loaded iteration and grad accum steps
+        self.start_step = iteration * getattr(self.args, 'gradient_accumulation_steps', 1)
     def _build_tracking(self):
         # Indent content of the method
         if self.data_parallel_rank == 0 and self.config.trainer.get("logger", None):
@@ -626,14 +725,15 @@ class MegatronSFTTrainer:
 
             # Get position_ids and attention_mask in the format Megatron expects
             # This might depend on the specific model implementation (e.g., Llama)
-            # attn_mask_type = self.args.attn_mask_type # This argument is removed based on user feedback for megatron-core 0.13.0rc0
+            # Pass self.args which contains the necessary config like reset_position_ids etc.
             attention_mask_meg, loss_mask_meg, position_ids = get_ltor_masks_and_position_ids(
                 data=input_ids,
-                eod_token=self.tokenizer.eos_token_id, # Use EOS as EOD
+                eod_token=self.tokenizer.eos_token_id,  # Use EOS as EOD
                 reset_position_ids=self.args.reset_position_ids,
                 reset_attention_mask=self.args.reset_attention_mask,
-                eod_mask_loss=self.args.eod_mask_loss
-                # attn_mask_type argument removed
+                eod_mask_loss=self.args.eod_mask_loss,
+                # Assuming create_attention_mask is not needed or handled elsewhere based on the reference
+                # create_attention_mask=self.args.create_attention_mask_in_dataloader  # Uncomment if needed
             )
             # Note: The loss_mask returned by get_ltor_masks_and_position_ids might
             # differ from our dataset's loss_mask. We should likely use our dataset's mask.
@@ -669,13 +769,16 @@ class MegatronSFTTrainer:
         # It handles forward, backward, optimizer step, gradient clipping, and LR scheduling.
         # It operates on microbatches internally based on gradient_accumulation_steps.
         # We pass the DDP-wrapped model.
-        loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = train_step(
+        # Call Megatron's train_step, passing the transformer config and unpacking all return values
+        loss_dict, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad = train_step(
             forward_step_func=forward_step,
             data_iterator=batch_iterator,
             model=self.model, # Pass the DDP-wrapped model
             optimizer=self.optimizer,
-            opt_param_scheduler=self.lr_scheduler # Pass Megatron's scheduler
+            opt_param_scheduler=self.lr_scheduler, # Pass Megatron's scheduler
+            config=self.megatron_transformer_config # Pass the stored transformer config
         )
+        # TODO: Handle should_checkpoint, should_exit, exit_code if necessary
         # --- End Megatron Forward/Backward ---
 
         # Process results
@@ -761,8 +864,8 @@ class MegatronSFTTrainer:
         if self.tracking:
             # Add global_step for proper logging association
             log_metrics = {f"validation/{k}": v for k, v in metrics.items()}
-            log_metrics["global_step"] = global_step
-            self.tracking.log(log_metrics)
+            # Pass global_step as the 'step' keyword argument
+            self.tracking.log(log_metrics, step=global_step)
 
         return metrics
 
@@ -836,7 +939,8 @@ class MegatronSFTTrainer:
 
                 # Log metrics
                 if self.tracking and global_step % self.config.trainer.logging_steps == 0:
-                    self.tracking.log({**train_metrics, "global_step": global_step})
+                    # Pass global_step as the 'step' keyword argument
+                    self.tracking.log(train_metrics, step=global_step)
 
                 # Validation (using Megatron's eval_interval)
                 # Megatron's train_step might handle evaluation internally based on eval_interval.
@@ -887,6 +991,8 @@ class MegatronSFTTrainer:
 
         # --- Megatron Checkpoint Saving ---
         # Saves base model (potentially frozen), optimizer, scheduler, args.
+        # TODO: Track num_floating_point_operations_so_far accurately if needed for checkpoint metadata.
+        num_floating_point_operations_so_far_placeholder = 0
         save_checkpoint(iteration=iteration,
                         model=self.model, # Pass DDP-wrapped model
                         optimizer=self.optimizer,
