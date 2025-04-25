@@ -4,5 +4,8 @@
         "editor.codeActionsOnSave": {
             "source.organizeImports": "always",
         }
-    }
+    },
+    "python.analysis.extraPaths": [
+        "./libs/Megatron-LM"
+    ]
 }
